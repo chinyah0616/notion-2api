@@ -86,8 +86,6 @@ class NotionAIProvider(BaseProvider):
 
         async def stream_generator() -> AsyncGenerator[bytes, None]:
             request_id = f"chatcmpl-{uuid.uuid4()}"
-            incremental_fragments: List[str] = []
-            final_message: Optional[str] = None
             
             try:
                 model_name = request_data.get("model", settings.DEFAULT_MODEL)
@@ -99,6 +97,7 @@ class NotionAIProvider(BaseProvider):
                 payload = self._prepare_payload(request_data, thread_id, mapped_model, thread_type)
                 headers = self._prepare_headers()
 
+                # 发送角色信息
                 role_chunk = create_chat_completion_chunk(request_id, model_name, role="assistant")
                 yield create_sse_data(role_chunk)
 
@@ -119,7 +118,11 @@ class NotionAIProvider(BaseProvider):
                         yield e
 
                 sync_gen = sync_stream_iterator()
-              
+                
+                # 用于累积完整内容（用于日志）
+                accumulated_content = []
+                last_content = ""
+                
                 while True:
                     line = await run_in_threadpool(lambda: next(sync_gen, None))
                     if line is None:
@@ -128,28 +131,39 @@ class NotionAIProvider(BaseProvider):
                         raise line
 
                     parsed_results = self._parse_ndjson_line_to_texts(line)
+                    
                     for text_type, content in parsed_results:
+                        if not content:
+                            continue
+                            
                         if text_type == 'final':
-                            final_message = content
+                            # 如果是最终内容，清理后立即发送
+                            cleaned_content = self._clean_content(content)
+                            if cleaned_content and cleaned_content != last_content:
+                                # 避免重复发送相同内容
+                                chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_content)
+                                yield create_sse_data(chunk)
+                                last_content = cleaned_content
+                                accumulated_content = [cleaned_content]
+                                logger.info(f"发送最终内容块: {cleaned_content[:100]}...")
+                                
                         elif text_type == 'incremental':
-                            incremental_fragments.append(content)
-              
-                full_response = ""
-                if final_message:
-                    full_response = final_message
-                    logger.info(f"成功从 record-map 或 Gemini patch/event 中提取到最终消息。")
-                else:
-                    full_response = "".join(incremental_fragments)
-                    logger.info(f"使用拼接所有增量片段的方式获得最终消息。")
+                            # 增量内容，立即发送
+                            cleaned_content = self._clean_content(content)
+                            if cleaned_content:
+                                chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_content)
+                                yield create_sse_data(chunk)
+                                accumulated_content.append(cleaned_content)
+                                logger.debug(f"发送增量内容块: {cleaned_content}")
 
+                # 记录完整响应（仅用于日志）
+                full_response = "".join(accumulated_content)
                 if full_response:
-                    cleaned_response = self._clean_content(full_response)
-                    logger.info(f"清洗后的最终响应: {cleaned_response}")
-                    chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
-                    yield create_sse_data(chunk)
+                    logger.info(f"完整响应（已流式发送）: {full_response[:200]}...")
                 else:
-                    logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。请检查您的 .env 配置是否全部正确且凭证有效。")
+                    logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。")
 
+                # 发送结束标记
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
                 yield create_sse_data(final_chunk)
                 yield DONE_CHUNK
@@ -162,7 +176,15 @@ class NotionAIProvider(BaseProvider):
                 yield DONE_CHUNK
 
         if stream:
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                stream_generator(), 
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",  # 禁用 nginx 缓冲
+                }
+            )
         else:
             raise HTTPException(status_code=400, detail="此端点当前仅支持流式响应 (stream=true)。")
 
@@ -287,14 +309,20 @@ class NotionAIProvider(BaseProvider):
         content = re.sub(r'<thinking>[\s\S]*?</thinking>\s*', '', content, flags=re.IGNORECASE)
         content = re.sub(r'<thought>[\s\S]*?</thought>\s*', '', content, flags=re.IGNORECASE)
         
-        content = re.sub(r'^.*?Chinese whatmodel I am.*?Theyspecifically.*?requested.*?me.*?to.*?reply.*?in.*?Chinese\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?This.*?is.*?a.*?straightforward.*?question.*?about.*?my.*?identity.*?asan.*?AI.*?assistant\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?Idon\'t.*?need.*?to.*?use.*?any.*?tools.*?for.*?this.*?-\s*it\'s.*?asimple.*?informational.*?response.*?aboutwhat.*?I.*?am\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?Sincethe.*?user.*?asked.*?in.*?Chinese.*?and.*?specifically.*?requested.*?a.*?Chinese.*?response.*?I.*?should.*?respond.*?in.*?Chinese\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?What model are you.*?in Chinese and specifically requesting.*?me.*?to.*?reply.*?in.*?Chinese\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?This.*?is.*?a.*?question.*?about.*?my.*?identity.*?not requiring.*?any.*?tool.*?use.*?I.*?should.*?respond.*?directly.*?to.*?the.*?user.*?in.*?Chinese.*?as.*?requested\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?I.*?should.*?identify.*?myself.*?as.*?Notion.*?AI.*?as.*?mentioned.*?in.*?the.*?system.*?prompt.*?\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        content = re.sub(r'^.*?I.*?should.*?not.*?make.*?specific.*?claims.*?about.*?the.*?underlying.*?model.*?architecture.*?since.*?that.*?information.*?is.*?not.*?provided.*?in.*?my.*?context\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
+        # 清理各种思考过程文本
+        thinking_patterns = [
+            r'^.*?Chinese whatmodel I am.*?Theyspecifically.*?requested.*?me.*?to.*?reply.*?in.*?Chinese\.\s*',
+            r'^.*?This.*?is.*?a.*?straightforward.*?question.*?about.*?my.*?identity.*?asan.*?AI.*?assistant\.\s*',
+            r'^.*?Idon\'t.*?need.*?to.*?use.*?any.*?tools.*?for.*?this.*?-\s*it\'s.*?asimple.*?informational.*?response.*?aboutwhat.*?I.*?am\.\s*',
+            r'^.*?Sincethe.*?user.*?asked.*?in.*?Chinese.*?and.*?specifically.*?requested.*?a.*?Chinese.*?response.*?I.*?should.*?respond.*?in.*?Chinese\.\s*',
+            r'^.*?What model are you.*?in Chinese and specifically requesting.*?me.*?to.*?reply.*?in.*?Chinese\.\s*',
+            r'^.*?This.*?is.*?a.*?question.*?about.*?my.*?identity.*?not requiring.*?any.*?tool.*?use.*?I.*?should.*?respond.*?directly.*?to.*?the.*?user.*?in.*?Chinese.*?as.*?requested\.\s*',
+            r'^.*?I.*?should.*?identify.*?myself.*?as.*?Notion.*?AI.*?as.*?mentioned.*?in.*?the.*?system.*?prompt.*?\s*',
+            r'^.*?I.*?should.*?not.*?make.*?specific.*?claims.*?about.*?the.*?underlying.*?model.*?architecture.*?since.*?that.*?information.*?is.*?not.*?provided.*?in.*?my.*?context\.\s*'
+        ]
+        
+        for pattern in thinking_patterns:
+            content = re.sub(pattern, '', content, flags=re.IGNORECASE | re.DOTALL)
         
         return content.strip()
 
@@ -323,28 +351,28 @@ class NotionAIProvider(BaseProvider):
                     path = operation.get("p", "")
                     value = operation.get("v")
                     
-                    # 【修改】Gemini 的完整内容 patch 格式
+                    # Gemini 的完整内容 patch 格式
                     if op_type == "a" and path.endswith("/s/-") and isinstance(value, dict) and value.get("type") == "markdown-chat":
                         content = value.get("value", "")
                         if content:
                             logger.info("从 'patch' (Gemini-style) 中提取到完整内容。")
                             results.append(('final', content))
                     
-                    # 【修改】Gemini 的增量内容 patch 格式
+                    # Gemini 的增量内容 patch 格式
                     elif op_type == "x" and "/s/" in path and path.endswith("/value") and isinstance(value, str):
                         content = value
                         if content:
-                            logger.info(f"从 'patch' (Gemini增量) 中提取到内容: {content}")
+                            logger.debug(f"从 'patch' (Gemini增量) 中提取到内容片段")
                             results.append(('incremental', content))
                     
-                    # 【修改】Claude 和 GPT 的增量内容 patch 格式
+                    # Claude 和 GPT 的增量内容 patch 格式
                     elif op_type == "x" and "/value/" in path and isinstance(value, str):
                         content = value
                         if content:
-                            logger.info(f"从 'patch' (Claude/GPT增量) 中提取到内容: {content}")
+                            logger.debug(f"从 'patch' (Claude/GPT增量) 中提取到内容片段")
                             results.append(('incremental', content))
                     
-                    # 【修改】Claude 和 GPT 的完整内容 patch 格式
+                    # Claude 和 GPT 的完整内容 patch 格式
                     elif op_type == "a" and path.endswith("/value/-") and isinstance(value, dict) and value.get("type") == "text":
                         content = value.get("content", "")
                         if content:
@@ -379,7 +407,7 @@ class NotionAIProvider(BaseProvider):
                             break 
     
         except (json.JSONDecodeError, AttributeError) as e:
-            logger.warning(f"解析NDJSON行失败: {e} - Line: {line.decode('utf-8', errors='ignore')}")
+            logger.warning(f"解析NDJSON行失败: {e}")
         
         return results
 
