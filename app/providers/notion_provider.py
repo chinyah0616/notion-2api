@@ -119,9 +119,8 @@ class NotionAIProvider(BaseProvider):
 
                 sync_gen = sync_stream_iterator()
                 
-                # 用于累积完整内容（用于日志）
+                # 用于累积完整内容（仅用于日志）
                 accumulated_content = []
-                last_content = ""
                 
                 while True:
                     line = await run_in_threadpool(lambda: next(sync_gen, None))
@@ -135,20 +134,9 @@ class NotionAIProvider(BaseProvider):
                     for text_type, content in parsed_results:
                         if not content:
                             continue
-                            
-                        if text_type == 'final':
-                            # 如果是最终内容，清理后立即发送
-                            cleaned_content = self._clean_content(content)
-                            if cleaned_content and cleaned_content != last_content:
-                                # 避免重复发送相同内容
-                                chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_content)
-                                yield create_sse_data(chunk)
-                                last_content = cleaned_content
-                                accumulated_content = [cleaned_content]
-                                logger.info(f"发送最终内容块: {cleaned_content[:100]}...")
-                                
-                        elif text_type == 'incremental':
-                            # 增量内容，立即发送
+                        
+                        # 只处理增量内容，忽略最终内容以避免重复
+                        if text_type == 'incremental':
                             cleaned_content = self._clean_content(content)
                             if cleaned_content:
                                 chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_content)
@@ -335,15 +323,8 @@ class NotionAIProvider(BaseProvider):
             data = json.loads(s)
             logger.debug(f"原始响应数据: {json.dumps(data, ensure_ascii=False)}")
             
-            # 格式1: Gemini 返回的 markdown-chat 事件
-            if data.get("type") == "markdown-chat":
-                content = data.get("value", "")
-                if content:
-                    logger.info("从 'markdown-chat' 直接事件中提取到内容。")
-                    results.append(('final', content))
-
-            # 格式2: Claude 和 GPT 返回的补丁流，以及 Gemini 的 patch 格式
-            elif data.get("type") == "patch" and "v" in data:
+            # 只处理增量内容，忽略所有 final 类型的内容
+            if data.get("type") == "patch" and "v" in data:
                 for operation in data.get("v", []):
                     if not isinstance(operation, dict): continue
                     
@@ -351,15 +332,8 @@ class NotionAIProvider(BaseProvider):
                     path = operation.get("p", "")
                     value = operation.get("v")
                     
-                    # Gemini 的完整内容 patch 格式
-                    if op_type == "a" and path.endswith("/s/-") and isinstance(value, dict) and value.get("type") == "markdown-chat":
-                        content = value.get("value", "")
-                        if content:
-                            logger.info("从 'patch' (Gemini-style) 中提取到完整内容。")
-                            results.append(('final', content))
-                    
                     # Gemini 的增量内容 patch 格式
-                    elif op_type == "x" and "/s/" in path and path.endswith("/value") and isinstance(value, str):
+                    if op_type == "x" and "/s/" in path and path.endswith("/value") and isinstance(value, str):
                         content = value
                         if content:
                             logger.debug(f"从 'patch' (Gemini增量) 中提取到内容片段")
@@ -371,40 +345,6 @@ class NotionAIProvider(BaseProvider):
                         if content:
                             logger.debug(f"从 'patch' (Claude/GPT增量) 中提取到内容片段")
                             results.append(('incremental', content))
-                    
-                    # Claude 和 GPT 的完整内容 patch 格式
-                    elif op_type == "a" and path.endswith("/value/-") and isinstance(value, dict) and value.get("type") == "text":
-                        content = value.get("content", "")
-                        if content:
-                            logger.info("从 'patch' (Claude/GPT-style) 中提取到完整内容。")
-                            results.append(('final', content))
-
-            # 格式3: 处理record-map类型的数据
-            elif data.get("type") == "record-map" and "recordMap" in data:
-                record_map = data["recordMap"]
-                if "thread_message" in record_map:
-                    for msg_id, msg_data in record_map["thread_message"].items():
-                        value_data = msg_data.get("value", {}).get("value", {})
-                        step = value_data.get("step", {})
-                        if not step: continue
-
-                        content = ""
-                        step_type = step.get("type")
-
-                        if step_type == "markdown-chat":
-                            content = step.get("value", "")
-                        elif step_type == "agent-inference":
-                            agent_values = step.get("value", [])
-                            if isinstance(agent_values, list):
-                                for item in agent_values:
-                                    if isinstance(item, dict) and item.get("type") == "text":
-                                        content = item.get("content", "")
-                                        break
-                        
-                        if content and isinstance(content, str):
-                            logger.info(f"从 record-map (type: {step_type}) 提取到最终内容。")
-                            results.append(('final', content))
-                            break 
     
         except (json.JSONDecodeError, AttributeError) as e:
             logger.warning(f"解析NDJSON行失败: {e}")
