@@ -121,7 +121,7 @@ class NotionAIProvider(BaseProvider):
                 
                 # 用于累积完整内容（仅用于日志）
                 accumulated_content = []
-                is_first_chunk = True
+                event_count = 0
                 
                 while True:
                     line = await run_in_threadpool(lambda: next(sync_gen, None))
@@ -136,25 +136,20 @@ class NotionAIProvider(BaseProvider):
                         if not content:
                             continue
                         
-                        # 只处理增量内容
-                        if text_type == 'incremental':
-                            # 对第一个内容块特别记录
-                            if is_first_chunk:
-                                logger.info(f"第一个内容块（原始）: {repr(content[:100])}")
-                                is_first_chunk = False
-                            
-                            # 直接发送原始内容，不进行清理
-                            # 保留所有格式和换行符
-                            if content:
-                                chunk = create_chat_completion_chunk(request_id, model_name, content=content)
-                                yield create_sse_data(chunk)
-                                accumulated_content.append(content)
-                                logger.debug(f"发送内容块: {repr(content[:50]) if len(content) > 50 else repr(content)}")
+                        event_count += 1
+                        logger.debug(f"Event #{event_count} - Type: {text_type}, Content: {repr(content[:100]) if len(content) > 100 else repr(content)}")
+                        
+                        # 处理所有类型的内容（incremental, update, append等）
+                        if text_type in ['incremental', 'update', 'append']:
+                            # 直接发送原始内容，保留所有格式
+                            chunk = create_chat_completion_chunk(request_id, model_name, content=content)
+                            yield create_sse_data(chunk)
+                            accumulated_content.append(content)
 
                 # 记录完整响应（仅用于日志）
                 full_response = "".join(accumulated_content)
                 if full_response:
-                    logger.info(f"完整响应（已流式发送）: {full_response[:200]}...")
+                    logger.info(f"完整响应（{event_count}个事件）: {full_response[:200]}...")
                 else:
                     logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。")
 
@@ -298,16 +293,23 @@ class NotionAIProvider(BaseProvider):
         return payload
 
     def _parse_ndjson_line_to_texts(self, line: bytes) -> List[Tuple[str, str]]:
+        """
+        解析NDJSON行，提取所有类型的文本内容
+        返回: [(类型, 内容), ...]
+        类型可以是: 'update', 'append', 'incremental' 等
+        """
         results: List[Tuple[str, str]] = []
         try:
             s = line.decode("utf-8", errors="ignore").strip()
             if not s: return results
             
             data = json.loads(s)
-            logger.debug(f"原始响应数据: {json.dumps(data, ensure_ascii=False)[:200]}")
             
-            # 只处理增量内容，忽略所有 final 类型的内容
-            if data.get("type") == "patch" and "v" in data:
+            # 处理不同类型的事件
+            event_type = data.get("type", "")
+            
+            # 1. 处理 patch 类型（最常见）
+            if event_type == "patch" and "v" in data:
                 for operation in data.get("v", []):
                     if not isinstance(operation, dict): continue
                     
@@ -315,20 +317,59 @@ class NotionAIProvider(BaseProvider):
                     path = operation.get("p", "")
                     value = operation.get("v")
                     
-                    # Gemini 的增量内容 patch 格式
-                    if op_type == "x" and "/s/" in path and path.endswith("/value") and isinstance(value, str):
-                        if value:  # 直接返回原始内容
-                            logger.debug(f"Gemini增量内容: {repr(value[:50])}")
+                    # 处理不同的 patch 操作
+                    if op_type == "x" and isinstance(value, str) and value:
+                        # 判断是 update 还是 append
+                        if "update_task_message" in path or "/task_message/" in path:
+                            logger.debug(f"检测到 update_task_message: {repr(value[:50])}")
+                            results.append(('update', value))
+                        elif "append_to_message_content" in path or "/message_content/" in path:
+                            logger.debug(f"检测到 append_to_message_content: {repr(value[:50])}")
+                            results.append(('append', value))
+                        elif "/s/" in path and path.endswith("/value"):
+                            # Gemini 的增量内容格式
+                            logger.debug(f"检测到 Gemini 增量内容: {repr(value[:50])}")
+                            results.append(('incremental', value))
+                        elif "/value/" in path:
+                            # Claude/GPT 的增量内容格式
+                            logger.debug(f"检测到 Claude/GPT 增量内容: {repr(value[:50])}")
+                            results.append(('incremental', value))
+                        else:
+                            # 其他未知格式，也尝试处理
+                            logger.debug(f"检测到未知格式内容 (path: {path}): {repr(value[:50])}")
                             results.append(('incremental', value))
                     
-                    # Claude 和 GPT 的增量内容 patch 格式
-                    elif op_type == "x" and "/value/" in path and isinstance(value, str):
-                        if value:  # 直接返回原始内容
-                            logger.debug(f"Claude/GPT增量内容: {repr(value[:50])}")
-                            results.append(('incremental', value))
+                    # 处理设置操作（可能包含初始内容）
+                    elif op_type == "s" and isinstance(value, str) and value:
+                        logger.debug(f"检测到设置操作内容: {repr(value[:50])}")
+                        results.append(('update', value))
+            
+            # 2. 处理直接的消息事件
+            elif event_type == "update_task_message":
+                content = data.get("value", "")
+                if content:
+                    logger.debug(f"检测到直接 update_task_message 事件: {repr(content[:50])}")
+                    results.append(('update', content))
+            
+            elif event_type == "append_to_message_content":
+                content = data.get("value", "")
+                if content:
+                    logger.debug(f"检测到直接 append_to_message_content 事件: {repr(content[:50])}")
+                    results.append(('append', content))
+            
+            # 3. 处理 markdown-chat 类型（某些模型可能使用）
+            elif event_type == "markdown-chat":
+                content = data.get("value", "")
+                if content:
+                    logger.debug(f"检测到 markdown-chat 事件: {repr(content[:50])}")
+                    results.append(('incremental', content))
+            
+            # 记录未处理的事件类型（用于调试）
+            if not results and event_type:
+                logger.debug(f"未处理的事件类型: {event_type}, 数据: {json.dumps(data, ensure_ascii=False)[:200]}")
     
         except (json.JSONDecodeError, AttributeError) as e:
-            logger.warning(f"解析NDJSON行失败: {e}")
+            logger.warning(f"解析NDJSON行失败: {e}, 原始数据: {line.decode('utf-8', errors='ignore')[:200]}")
         
         return results
 
