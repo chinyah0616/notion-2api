@@ -119,10 +119,9 @@ class NotionAIProvider(BaseProvider):
 
                 sync_gen = sync_stream_iterator()
                 
-                # 用于跟踪内容
+                # 用于累积完整内容（仅用于日志）
                 accumulated_content = []
-                event_count = 0
-                sent_content_set = set()  # 避免重复发送相同内容
+                is_first_chunk = True
                 
                 while True:
                     line = await run_in_threadpool(lambda: next(sync_gen, None))
@@ -131,39 +130,33 @@ class NotionAIProvider(BaseProvider):
                     if isinstance(line, Exception):
                         raise line
 
-                    event_count += 1
-                    parsed_results = self._parse_ndjson_line_comprehensive(line, event_count)
+                    parsed_results = self._parse_ndjson_line_to_texts(line)
                     
-                    for content_type, content in parsed_results:
+                    for text_type, content in parsed_results:
                         if not content:
                             continue
                         
-                        # 检查是否已发送过这个内容片段
-                        content_hash = hash(content)
-                        if content_hash in sent_content_set:
-                            logger.debug(f"跳过重复内容: {repr(content[:50])}")
-                            continue
-                        
-                        sent_content_set.add(content_hash)
-                        
-                        # 发送内容
-                        chunk = create_chat_completion_chunk(request_id, model_name, content=content)
-                        yield create_sse_data(chunk)
-                        accumulated_content.append(content)
-                        
-                        if event_count <= 3:
-                            logger.info(f"事件#{event_count} - 类型:{content_type} - 内容: {repr(content[:100])}")
-                        else:
-                            logger.debug(f"事件#{event_count} - 类型:{content_type} - 内容长度: {len(content)}")
+                        # 只处理增量内容
+                        if text_type == 'incremental':
+                            # 对第一个内容块特别记录
+                            if is_first_chunk:
+                                logger.info(f"第一个内容块（原始）: {repr(content[:100])}")
+                                is_first_chunk = False
+                            
+                            # 直接发送原始内容，不进行清理
+                            # 保留所有格式和换行符
+                            if content:
+                                chunk = create_chat_completion_chunk(request_id, model_name, content=content)
+                                yield create_sse_data(chunk)
+                                accumulated_content.append(content)
+                                logger.debug(f"发送内容块: {repr(content[:50]) if len(content) > 50 else repr(content)}")
 
-                # 记录完整响应
+                # 记录完整响应（仅用于日志）
                 full_response = "".join(accumulated_content)
                 if full_response:
-                    logger.info(f"完整响应（{event_count}个事件）: {full_response[:200]}...")
-                    if len(full_response) < 50:
-                        logger.warning(f"响应内容较短，可能有内容丢失: {repr(full_response)}")
+                    logger.info(f"完整响应（已流式发送）: {full_response[:200]}...")
                 else:
-                    logger.warning(f"警告: 处理了{event_count}个事件但未提取到任何有效文本。")
+                    logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。")
 
                 # 发送结束标记
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
@@ -184,7 +177,7 @@ class NotionAIProvider(BaseProvider):
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
+                    "X-Accel-Buffering": "no",  # 禁用 nginx 缓冲
                     "Transfer-Encoding": "chunked",
                 }
             )
@@ -304,154 +297,40 @@ class NotionAIProvider(BaseProvider):
         
         return payload
 
-    def _parse_ndjson_line_comprehensive(self, line: bytes, event_num: int) -> List[Tuple[str, str]]:
-        """
-        综合解析所有可能的数据格式，确保不丢失任何内容
-        """
+    def _parse_ndjson_line_to_texts(self, line: bytes) -> List[Tuple[str, str]]:
         results: List[Tuple[str, str]] = []
         try:
             s = line.decode("utf-8", errors="ignore").strip()
             if not s: return results
             
             data = json.loads(s)
+            logger.debug(f"原始响应数据: {json.dumps(data, ensure_ascii=False)[:200]}")
             
-            # 记录前几个事件的完整数据用于调试
-            if event_num <= 3:
-                logger.info(f"事件#{event_num} 原始数据类型: {data.get('type')}")
-                logger.debug(f"事件#{event_num} 完整数据: {json.dumps(data, ensure_ascii=False)[:500]}")
-            
-            # 1. 处理直接的文本事件（如 markdown-chat）
-            if data.get("type") == "markdown-chat":
-                content = data.get("value", "")
-                if content:
-                    logger.info(f"[markdown-chat] 提取内容: {repr(content[:100])}")
-                    results.append(('direct', content))
-            
-            # 2. 处理 update 类型事件
-            elif data.get("type") == "update":
-                # 尝试多种路径提取内容
-                if "value" in data:
-                    value = data["value"]
-                    if isinstance(value, str):
-                        if value:
-                            logger.info(f"[update-string] 提取内容: {repr(value[:100])}")
-                            results.append(('update', value))
-                    elif isinstance(value, dict):
-                        # 检查各种可能的内容路径
-                        for key in ["content", "text", "message", "value"]:
-                            if key in value:
-                                content = value[key]
-                                if isinstance(content, str) and content:
-                                    logger.info(f"[update-dict-{key}] 提取内容: {repr(content[:100])}")
-                                    results.append(('update', content))
-                                    break
-            
-            # 3. 处理 patch 类型事件（增量更新）
-            elif data.get("type") == "patch" and "v" in data:
+            # 只处理增量内容，忽略所有 final 类型的内容
+            if data.get("type") == "patch" and "v" in data:
                 for operation in data.get("v", []):
-                    if not isinstance(operation, dict): 
-                        continue
+                    if not isinstance(operation, dict): continue
                     
                     op_type = operation.get("o")
                     path = operation.get("p", "")
                     value = operation.get("v")
                     
-                    # 3.1 处理替换操作（可能包含初始内容）
-                    if op_type == "r" and isinstance(value, str) and value:
-                        logger.info(f"[patch-replace] 路径:{path} 内容: {repr(value[:100])}")
-                        results.append(('replace', value))
+                    # Gemini 的增量内容 patch 格式
+                    if op_type == "x" and "/s/" in path and path.endswith("/value") and isinstance(value, str):
+                        if value:  # 直接返回原始内容
+                            logger.debug(f"Gemini增量内容: {repr(value[:50])}")
+                            results.append(('incremental', value))
                     
-                    # 3.2 处理设置操作（可能包含初始内容）
-                    elif op_type == "s" and isinstance(value, str) and value:
-                        logger.info(f"[patch-set] 路径:{path} 内容: {repr(value[:100])}")
-                        results.append(('set', value))
-                    
-                    # 3.3 处理扩展操作（增量内容）
-                    elif op_type == "x" and isinstance(value, str) and value:
-                        # Gemini 格式
-                        if "/s/" in path and path.endswith("/value"):
-                            logger.debug(f"[patch-extend-gemini] 内容片段")
-                            results.append(('extend', value))
-                        # Claude/GPT 格式
-                        elif "/value/" in path:
-                            logger.debug(f"[patch-extend-claude] 内容片段")
-                            results.append(('extend', value))
-                        # 通用格式
-                        else:
-                            logger.debug(f"[patch-extend-generic] 路径:{path}")
-                            results.append(('extend', value))
-                    
-                    # 3.4 处理添加操作（可能是完整内容）
-                    elif op_type == "a":
-                        if isinstance(value, str) and value:
-                            logger.info(f"[patch-add-string] 内容: {repr(value[:100])}")
-                            results.append(('add', value))
-                        elif isinstance(value, dict):
-                            # 处理嵌套的内容
-                            if value.get("type") == "text" and "content" in value:
-                                content = value["content"]
-                                if content:
-                                    logger.info(f"[patch-add-text] 内容: {repr(content[:100])}")
-                                    results.append(('add', content))
-                            elif value.get("type") == "markdown-chat" and "value" in value:
-                                content = value["value"]
-                                if content:
-                                    logger.info(f"[patch-add-markdown] 内容: {repr(content[:100])}")
-                                    results.append(('add', content))
-            
-            # 4. 处理 record-map 类型（可能包含完整响应）
-            elif data.get("type") == "record-map" and "recordMap" in data:
-                record_map = data["recordMap"]
-                # 检查 thread_message
-                if "thread_message" in record_map:
-                    for msg_id, msg_data in record_map["thread_message"].items():
-                        value_data = msg_data.get("value", {}).get("value", {})
-                        step = value_data.get("step", {})
-                        
-                        if step:
-                            content = self._extract_content_from_step(step)
-                            if content:
-                                logger.info(f"[record-map] 提取内容: {repr(content[:100])}")
-                                results.append(('record', content))
-                                break  # 通常只需要第一个
-            
-            # 5. 处理其他可能的格式
-            elif "content" in data and isinstance(data["content"], str):
-                content = data["content"]
-                if content:
-                    logger.info(f"[root-content] 提取内容: {repr(content[:100])}")
-                    results.append(('root', content))
-            elif "text" in data and isinstance(data["text"], str):
-                content = data["text"]
-                if content:
-                    logger.info(f"[root-text] 提取内容: {repr(content[:100])}")
-                    results.append(('root', content))
+                    # Claude 和 GPT 的增量内容 patch 格式
+                    elif op_type == "x" and "/value/" in path and isinstance(value, str):
+                        if value:  # 直接返回原始内容
+                            logger.debug(f"Claude/GPT增量内容: {repr(value[:50])}")
+                            results.append(('incremental', value))
     
         except (json.JSONDecodeError, AttributeError) as e:
-            logger.warning(f"解析事件#{event_num}失败: {e}")
+            logger.warning(f"解析NDJSON行失败: {e}")
         
         return results
-
-    def _extract_content_from_step(self, step: Dict[str, Any]) -> Optional[str]:
-        """从step对象中提取内容"""
-        step_type = step.get("type")
-        
-        if step_type == "markdown-chat":
-            return step.get("value", "")
-        elif step_type == "agent-inference":
-            agent_values = step.get("value", [])
-            if isinstance(agent_values, list):
-                for item in agent_values:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        return item.get("content", "")
-        elif step_type == "text":
-            return step.get("content", "")
-        
-        # 尝试直接获取value
-        if "value" in step and isinstance(step["value"], str):
-            return step["value"]
-        
-        return None
 
     async def get_models(self) -> JSONResponse:
         model_data = {
