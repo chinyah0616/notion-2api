@@ -5,6 +5,8 @@ import logging
 import uuid
 import re
 import cloudscraper
+import threading
+from itertools import cycle
 from typing import Dict, Any, AsyncGenerator, List, Optional, Tuple
 from datetime import datetime
 
@@ -12,11 +14,10 @@ from fastapi import HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.concurrency import run_in_threadpool
 
-from app.core.config import settings
+from app.core.config import settings, NotionAccount
 from app.providers.base_provider import BaseProvider
 from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, DONE_CHUNK
 
-# 设置日志记录器
 logger = logging.getLogger(__name__)
 
 class NotionAIProvider(BaseProvider):
@@ -27,15 +28,27 @@ class NotionAIProvider(BaseProvider):
             "saveTransactions": "https://www.notion.so/api/v3/saveTransactionsFanout"
         }
         
-        if not all([settings.NOTION_COOKIE, settings.NOTION_SPACE_ID, settings.NOTION_USER_ID]):
-            raise ValueError("配置错误: NOTION_COOKIE, NOTION_SPACE_ID 和 NOTION_USER_ID 必须在 .env 文件中全部设置。")
+        if not settings.ACCOUNTS:
+            raise ValueError("配置错误: 未找到任何 Notion 账号。")
+        
+        # 线程安全的轮询器
+        self.account_cycler = cycle(settings.ACCOUNTS)
+        self.lock = threading.Lock()
 
         self._warmup_session()
+        
+    def _get_next_account(self) -> NotionAccount:
+        """线程安全地获取下一个账号"""
+        with self.lock:
+            account = next(self.account_cycler)
+            logger.info(f"使用账号: {account.user_name or account.user_id}")
+            return account
 
     def _warmup_session(self):
         try:
             logger.info("正在进行会话预热 (Session Warm-up)...")
-            headers = self._prepare_headers()
+            account = self._get_next_account()
+            headers = self._prepare_headers(account)
             headers.pop("Accept", None)
             response = self.scraper.get("https://www.notion.so/", headers=headers, timeout=30)
             response.raise_for_status()
@@ -43,33 +56,33 @@ class NotionAIProvider(BaseProvider):
         except Exception as e:
             logger.error(f"会话预热失败: {e}", exc_info=True)
             
-    async def _create_thread(self, thread_type: str) -> str:
+    async def _create_thread(self, thread_type: str, account: NotionAccount) -> str:
         thread_id = str(uuid.uuid4())
         payload = {
             "requestId": str(uuid.uuid4()),
             "transactions": [{
                 "id": str(uuid.uuid4()),
-                "spaceId": settings.NOTION_SPACE_ID,
+                "spaceId": account.space_id,
                 "operations": [{
-                    "pointer": {"table": "thread", "id": thread_id, "spaceId": settings.NOTION_SPACE_ID},
+                    "pointer": {"table": "thread", "id": thread_id, "spaceId": account.space_id},
                     "path": [],
                     "command": "set",
                     "args": {
-                        "id": thread_id, "version": 1, "parent_id": settings.NOTION_SPACE_ID,
-                        "parent_table": "space", "space_id": settings.NOTION_SPACE_ID,
+                        "id": thread_id, "version": 1, "parent_id": account.space_id,
+                        "parent_table": "space", "space_id": account.space_id,
                         "created_time": int(time.time() * 1000),
-                        "created_by_id": settings.NOTION_USER_ID, "created_by_table": "notion_user",
+                        "created_by_id": account.user_id, "created_by_table": "notion_user",
                         "messages": [], "data": {}, "alive": True, "type": thread_type
                     }
                 }]
             }]
         }
         try:
-            logger.info(f"正在创建新的对话线程 (type: {thread_type})...")
+            logger.info(f"正在为账号 {account.user_id} 创建新的对话线程...")
             response = await run_in_threadpool(
                 lambda: self.scraper.post(
                     self.api_endpoints["saveTransactions"],
-                    headers=self._prepare_headers(),
+                    headers=self._prepare_headers(account),
                     json=payload,
                     timeout=20
                 )
@@ -78,11 +91,14 @@ class NotionAIProvider(BaseProvider):
             logger.info(f"对话线程创建成功, Thread ID: {thread_id}")
             return thread_id
         except Exception as e:
-            logger.error(f"创建对话线程失败: {e}", exc_info=True)
+            logger.error(f"为账号 {account.user_id} 创建对话线程失败: {e}", exc_info=True)
             raise Exception("无法创建新的对话线程。")
 
     async def chat_completion(self, request_data: Dict[str, Any]):
         stream = request_data.get("stream", True)
+
+        # 在异步生成器外部选择账号，确保整个请求使用同一个账号
+        account = self._get_next_account()
 
         async def stream_generator() -> AsyncGenerator[bytes, None]:
             request_id = f"chatcmpl-{uuid.uuid4()}"
@@ -93,18 +109,18 @@ class NotionAIProvider(BaseProvider):
                 
                 thread_type = "markdown-chat" if mapped_model.startswith("vertex-") else "workflow"
                 
-                thread_id = await self._create_thread(thread_type)
-                payload = self._prepare_payload(request_data, thread_id, mapped_model, thread_type)
-                headers = self._prepare_headers()
+                thread_id = await self._create_thread(thread_type, account)
+                payload = self._prepare_payload(request_data, thread_id, mapped_model, account)
+                headers = self._prepare_headers(account)
 
-                # 发送角色信息
                 role_chunk = create_chat_completion_chunk(request_id, model_name, role="assistant")
                 yield create_sse_data(role_chunk)
 
                 def sync_stream_iterator():
                     try:
                         logger.info(f"请求 Notion AI URL: {self.api_endpoints['runInference']}")
-                        logger.info(f"请求体: {json.dumps(payload, indent=2, ensure_ascii=False)}")
+                        # 不再打印完整的payload，因为它可能包含敏感信息
+                        logger.info("正在发送请求到 Notion AI...")
                         
                         response = self.scraper.post(
                             self.api_endpoints['runInference'], headers=headers, json=payload, stream=True,
@@ -119,9 +135,9 @@ class NotionAIProvider(BaseProvider):
 
                 sync_gen = sync_stream_iterator()
                 
-                # 用于累积完整内容（仅用于日志）
                 accumulated_content = []
-                is_first_chunk = True
+                event_count = 0
+                sent_content_set = set()
                 
                 while True:
                     line = await run_in_threadpool(lambda: next(sync_gen, None))
@@ -130,35 +146,31 @@ class NotionAIProvider(BaseProvider):
                     if isinstance(line, Exception):
                         raise line
 
-                    parsed_results = self._parse_ndjson_line_to_texts(line)
+                    event_count += 1
+                    parsed_results = self._parse_ndjson_line_comprehensive(line, event_count)
                     
-                    for text_type, content in parsed_results:
-                        if not content:
-                            continue
+                    for content_type, content in parsed_results:
+                        if not content: continue
+                        content_hash = hash(content)
+                        if content_hash in sent_content_set: continue
                         
-                        # 只处理增量内容
-                        if text_type == 'incremental':
-                            # 对第一个内容块特别记录
-                            if is_first_chunk:
-                                logger.info(f"第一个内容块（原始）: {repr(content[:100])}")
-                                is_first_chunk = False
-                            
-                            # 直接发送原始内容，不进行清理
-                            # 保留所有格式和换行符
-                            if content:
-                                chunk = create_chat_completion_chunk(request_id, model_name, content=content)
-                                yield create_sse_data(chunk)
-                                accumulated_content.append(content)
-                                logger.debug(f"发送内容块: {repr(content[:50]) if len(content) > 50 else repr(content)}")
+                        sent_content_set.add(content_hash)
+                        
+                        chunk = create_chat_completion_chunk(request_id, model_name, content=content)
+                        yield create_sse_data(chunk)
+                        accumulated_content.append(content)
+                        
+                        if event_count <= 3:
+                            logger.info(f"事件#{event_count} - 类型:{content_type} - 内容: {repr(content[:100])}")
+                        else:
+                            logger.debug(f"事件#{event_count} - 类型:{content_type} - 内容长度: {len(content)}")
 
-                # 记录完整响应（仅用于日志）
                 full_response = "".join(accumulated_content)
                 if full_response:
-                    logger.info(f"完整响应（已流式发送）: {full_response[:200]}...")
+                    logger.info(f"完整响应（{event_count}个事件）: {full_response[:200]}...")
                 else:
-                    logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。")
+                    logger.warning(f"警告: 处理了{event_count}个事件但未提取到任何有效文本。")
 
-                # 发送结束标记
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
                 yield create_sse_data(final_chunk)
                 yield DONE_CHUNK
@@ -171,30 +183,21 @@ class NotionAIProvider(BaseProvider):
                 yield DONE_CHUNK
 
         if stream:
-            return StreamingResponse(
-                stream_generator(), 
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",  # 禁用 nginx 缓冲
-                    "Transfer-Encoding": "chunked",
-                }
-            )
+            return StreamingResponse(stream_generator(), media_type="text/event-stream")
         else:
             raise HTTPException(status_code=400, detail="此端点当前仅支持流式响应 (stream=true)。")
 
-    def _prepare_headers(self) -> Dict[str, str]:
-        cookie_source = (settings.NOTION_COOKIE or "").strip()
+    def _prepare_headers(self, account: NotionAccount) -> Dict[str, str]:
+        cookie_source = (account.cookie or "").strip()
         cookie_header = cookie_source if "=" in cookie_source else f"token_v2={cookie_source}"
 
         return {
             "Content-Type": "application/json",
             "Accept": "application/x-ndjson",
             "Cookie": cookie_header,
-            "x-notion-space-id": settings.NOTION_SPACE_ID,
-            "x-notion-active-user-header": settings.NOTION_USER_ID,
-            "x-notion-client-version": settings.NOTION_CLIENT_VERSION,
+            "x-notion-space-id": account.space_id,
+            "x-notion-active-user-header": account.user_id,
+            "x-notion-client-version": account.client_version,
             "notion-audit-log-platform": "web",
             "Origin": "https://www.notion.so",
             "Referer": "https://www.notion.so/",
@@ -208,15 +211,15 @@ class NotionAIProvider(BaseProvider):
             return f"{b[0:8]}-{b[8:12]}-{b[12:16]}-{b[16:20]}-{b[20:]}"
         return block_id
 
-    def _prepare_payload(self, request_data: Dict[str, Any], thread_id: str, mapped_model: str, thread_type: str) -> Dict[str, Any]:
-        req_block_id = request_data.get("notion_block_id") or settings.NOTION_BLOCK_ID
+    def _prepare_payload(self, request_data: Dict[str, Any], thread_id: str, mapped_model: str, account: NotionAccount) -> Dict[str, Any]:
+        req_block_id = request_data.get("notion_block_id") or account.block_id
         normalized_block_id = self._normalize_block_id(req_block_id) if req_block_id else None
 
         context_value: Dict[str, Any] = {
             "timezone": "Asia/Shanghai",
-            "spaceId": settings.NOTION_SPACE_ID,
-            "userId": settings.NOTION_USER_ID,
-            "userEmail": settings.NOTION_USER_EMAIL,
+            "spaceId": account.space_id,
+            "userId": account.user_id,
+            "userEmail": account.user_email,
             "currentDatetime": datetime.now().astimezone().isoformat(),
         }
         if normalized_block_id:
@@ -225,36 +228,15 @@ class NotionAIProvider(BaseProvider):
         config_value: Dict[str, Any]
         
         if mapped_model.startswith("vertex-"):
-            logger.info(f"检测到 Gemini 模型 ({mapped_model})，应用特定的 config 和 context。")
             context_value.update({
-                "userName": f" {settings.NOTION_USER_NAME}",
-                "spaceName": f"{settings.NOTION_USER_NAME}的 Notion",
-                "spaceViewId": "2008eefa-d0dc-80d5-9e67-000623befd8f",
+                "userName": f" {account.user_name}",
+                "spaceName": f"{account.user_name}的 Notion",
                 "surface": "ai_module"
             })
-            config_value = {
-                "type": thread_type,
-                "model": mapped_model,
-                "useWebSearch": True,
-                "enableAgentAutomations": False, "enableAgentIntegrations": False,
-                "enableBackgroundAgents": False, "enableCodegenIntegration": False,
-                "enableCustomAgents": False, "enableExperimentalIntegrations": False,
-                "enableLinkedDatabases": False, "enableAgentViewVersionHistoryTool": False,
-                "searchScopes": [{"type": "everything"}], "enableDatabaseAgents": False,
-                "enableAgentComments": False, "enableAgentForms": False,
-                "enableAgentMakesFormulas": False, "enableUserSessionContext": False,
-                "modelFromUser": True, "isCustomAgent": False
-            }
+            config_value = { "type": "markdown-chat", "model": mapped_model, "useWebSearch": True }
         else:
-            context_value.update({
-                "userName": settings.NOTION_USER_NAME,
-                "surface": "workflows"
-            })
-            config_value = {
-                "type": thread_type,
-                "model": mapped_model,
-                "useWebSearch": True,
-            }
+            context_value.update({"userName": account.user_name, "surface": "workflows"})
+            config_value = {"type": "workflow", "model": mapped_model, "useWebSearch": True}
 
         transcript = [
             {"id": str(uuid.uuid4()), "type": "config", "value": config_value},
@@ -262,20 +244,18 @@ class NotionAIProvider(BaseProvider):
         ]
       
         for msg in request_data.get("messages", []):
-            if msg.get("role") == "user":
+            role, content = msg.get("role"), msg.get("content")
+            if role == "user":
                 transcript.append({
-                    "id": str(uuid.uuid4()),
-                    "type": "user",
-                    "value": [[msg.get("content")]],
-                    "userId": settings.NOTION_USER_ID,
-                    "createdAt": datetime.now().astimezone().isoformat()
+                    "id": str(uuid.uuid4()), "type": "user", "value": [[content]],
+                    "userId": account.user_id, "createdAt": datetime.now().astimezone().isoformat()
                 })
-            elif msg.get("role") == "assistant":
-                transcript.append({"id": str(uuid.uuid4()), "type": "agent-inference", "value": [{"type": "text", "content": msg.get("content")}]})
+            elif role == "assistant":
+                transcript.append({"id": str(uuid.uuid4()), "type": "agent-inference", "value": [{"type": "text", "content": content}]})
 
         payload = {
             "traceId": str(uuid.uuid4()),
-            "spaceId": settings.NOTION_SPACE_ID,
+            "spaceId": account.space_id,
             "transcript": transcript,
             "threadId": thread_id,
             "createThread": False,
@@ -283,61 +263,78 @@ class NotionAIProvider(BaseProvider):
             "asPatchResponse": True,
             "generateTitle": True,
             "saveAllThreadOperations": True,
-            "threadType": thread_type
+            "threadType": config_value["type"]
         }
-
-        if mapped_model.startswith("vertex-"):
-            logger.info("为 Gemini 请求添加 debugOverrides。")
-            payload["debugOverrides"] = {
-                "emitAgentSearchExtractedResults": True,
-                "cachedInferences": {},
-                "annotationInferences": {},
-                "emitInferences": False
-            }
-        
         return payload
-
-    def _parse_ndjson_line_to_texts(self, line: bytes) -> List[Tuple[str, str]]:
+    
+    # _parse_ndjson_line_comprehensive 和 _extract_content_from_step 方法保持不变
+    # (从上一个回复中复制过来)
+    def _parse_ndjson_line_comprehensive(self, line: bytes, event_num: int) -> List[Tuple[str, str]]:
         results: List[Tuple[str, str]] = []
         try:
             s = line.decode("utf-8", errors="ignore").strip()
             if not s: return results
-            
             data = json.loads(s)
-            logger.debug(f"原始响应数据: {json.dumps(data, ensure_ascii=False)[:200]}")
             
-            # 只处理增量内容，忽略所有 final 类型的内容
-            if data.get("type") == "patch" and "v" in data:
-                for operation in data.get("v", []):
-                    if not isinstance(operation, dict): continue
-                    
-                    op_type = operation.get("o")
-                    path = operation.get("p", "")
-                    value = operation.get("v")
-                    
-                    # Gemini 的增量内容 patch 格式
-                    if op_type == "x" and "/s/" in path and path.endswith("/value") and isinstance(value, str):
-                        if value:  # 直接返回原始内容
-                            logger.debug(f"Gemini增量内容: {repr(value[:50])}")
-                            results.append(('incremental', value))
-                    
-                    # Claude 和 GPT 的增量内容 patch 格式
-                    elif op_type == "x" and "/value/" in path and isinstance(value, str):
-                        if value:  # 直接返回原始内容
-                            logger.debug(f"Claude/GPT增量内容: {repr(value[:50])}")
-                            results.append(('incremental', value))
-    
-        except (json.JSONDecodeError, AttributeError) as e:
-            logger.warning(f"解析NDJSON行失败: {e}")
-        
+            if event_num <= 3:
+                logger.info(f"事件#{event_num} 原始数据类型: {data.get('type')}")
+                logger.debug(f"事件#{event_num} 完整数据: {json.dumps(data, ensure_ascii=False)[:500]}")
+            
+            if data.get("type") == "markdown-chat":
+                content = data.get("value", "")
+                if content: results.append(('direct', content))
+            
+            elif data.get("type") == "update":
+                if "value" in data:
+                    value = data["value"]
+                    if isinstance(value, str) and value: results.append(('update', value))
+                    elif isinstance(value, dict):
+                        for key in ["content", "text", "message", "value"]:
+                            if key in value:
+                                content = value[key]
+                                if isinstance(content, str) and content:
+                                    results.append(('update', content)); break
+            
+            elif data.get("type") == "patch" and "v" in data:
+                for op in data.get("v", []):
+                    if not isinstance(op, dict): continue
+                    op_type, path, val = op.get("o"), op.get("p", ""), op.get("v")
+                    if op_type in ("r", "s", "x") and isinstance(val, str) and val:
+                        results.append((op_type, val))
+                    elif op_type == "a":
+                        if isinstance(val, str) and val: results.append(('add', val))
+                        elif isinstance(val, dict):
+                            if val.get("type") == "text" and "content" in val and val["content"]:
+                                results.append(('add', val["content"]))
+                            elif val.get("type") == "markdown-chat" and "value" in val and val["value"]:
+                                results.append(('add', val["value"]))
+            
+            elif data.get("type") == "record-map" and "recordMap" in data:
+                if "thread_message" in data["recordMap"]:
+                    for msg_data in data["recordMap"]["thread_message"].values():
+                        step = msg_data.get("value", {}).get("value", {}).get("step", {})
+                        if step:
+                            content = self._extract_content_from_step(step)
+                            if content: results.append(('record', content)); break
+            
+            elif "content" in data and isinstance(data["content"], str) and data["content"]:
+                results.append(('root', data["content"]))
+            elif "text" in data and isinstance(data["text"], str) and data["text"]:
+                results.append(('root', data["text"]))
+        except (json.JSONDecodeError, AttributeError): pass
         return results
 
+    def _extract_content_from_step(self, step: Dict[str, Any]) -> Optional[str]:
+        step_type = step.get("type")
+        if step_type == "markdown-chat": return step.get("value", "")
+        elif step_type == "agent-inference":
+            for item in step.get("value", []):
+                if isinstance(item, dict) and item.get("type") == "text": return item.get("content", "")
+        elif step_type == "text": return step.get("content", "")
+        if "value" in step and isinstance(step["value"], str): return step["value"]
+        return None
+
     async def get_models(self) -> JSONResponse:
-        model_data = {
-            "object": "list",
-            "data": [
-                {"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"}
-                for name in settings.KNOWN_MODELS
-            ]
-        }
+        model_data = {"object": "list", "data": [{"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"} for name in settings.KNOWN_MODELS]}
         return JSONResponse(content=model_data)
+
