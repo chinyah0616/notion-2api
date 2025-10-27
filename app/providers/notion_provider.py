@@ -141,7 +141,7 @@ class NotionAIProvider(BaseProvider):
                     for content_type, raw_content in parsed_results:
                         if not raw_content: continue
                         
-                        # 清洗内容
+                        # 【核心修正】清洗内容
                         cleaned_content = self._clean_content(raw_content)
                         
                         if cleaned_content:
@@ -173,7 +173,7 @@ class NotionAIProvider(BaseProvider):
             
     def _clean_content(self, content: str) -> str:
         """
-        清洗从 Notion AI 返回的原始文本流，去除思考过程、XML标签、分类标签和其他非文本内容。
+        【新增】清洗从 Notion AI 返回的原始文本流，去除思考过程、XML标签和其他非文本内容。
         """
         if not content:
             return ""
@@ -182,17 +182,27 @@ class NotionAIProvider(BaseProvider):
         content = re.sub(r'<thinking>[\s\S]*?</thinking>', '', content, flags=re.DOTALL)
         content = re.sub(r'<thought>[\s\S]*?</thought>', '', content, flags=re.DOTALL)
         
-        # 移除其他可能的XML标签
+        # 移除其他可能的XML标签，但保留内容
         content = re.sub(r'</?[^>]+>', '', content)
         
         # 移除可能出现在开头的、类似Base64的乱码字符串
+        # 这个正则表达式匹配一个由字母、数字、+、/、=组成的、长度至少为50的字符串
         content = re.sub(r'^[A-Za-z0-9+/=]{50,}\s*', '', content)
         
-        # 【核心修正】移除末尾的分类标签 (如: '打招呼', '问候语')
-        # 匹配末尾的空白符 + 1到5个汉字 + 可选的表情符号和空白符
-        content = re.sub(r'\s+[\u4e00-\u9fa5]{1,5}\s*[\U0001F600-\U0001F64F]?\s*$', '', content)
-        
-        return content.strip()
+        # 移除一些 Claude 模型特有的前缀
+        common_prefixes = [
+            "I'm sorry, I can't directly help with that, but I can provide some information.",
+            "I am unable to assist with that, as I am only a language model and do not have the capacity to understand and respond to your request.",
+            "I am not able to provide an answer to your question as I am a language model and do not have the capacity to help with that.",
+            # 中文
+            "我无法直接帮助您，但我可以提供一些信息。",
+            "我无法回答您的那个问题，因为我只是一个语言模型，无法理解并回应您的请求。",
+        ]
+        for prefix in common_prefixes:
+            if content.strip().startswith(prefix):
+                content = content.strip()[len(prefix):].lstrip()
+
+        return content
 
     def _prepare_headers(self, account: NotionAccount) -> Dict[str, str]:
         cookie_source = (account.cookie or "").strip()
