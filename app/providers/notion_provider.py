@@ -107,8 +107,14 @@ class NotionAIProvider(BaseProvider):
                 payload = self._prepare_payload(request_data, thread_id, mapped_model, account)
                 headers = self._prepare_headers(account)
 
+                # 1. 发送角色信息
                 role_chunk = create_chat_completion_chunk(request_id, model_name, role="assistant")
                 yield create_sse_data(role_chunk)
+
+                # 2. 【核心修正】立即发送 <think> 标签作为第一个内容块
+                initial_think_chunk = create_chat_completion_chunk(request_id, model_name, content="<think>")
+                yield create_sse_data(initial_think_chunk)
+
 
                 def sync_stream_iterator():
                     try:
@@ -125,7 +131,7 @@ class NotionAIProvider(BaseProvider):
 
                 sync_gen = sync_stream_iterator()
                 
-                accumulated_content = []
+                accumulated_content = ["<think>"] # 预先加入，用于日志
                 event_count = 0
                 
                 while True:
@@ -139,7 +145,6 @@ class NotionAIProvider(BaseProvider):
                     for content_type, raw_content in parsed_results:
                         if not raw_content: continue
                         
-                        # 【核心修正】对每个数据块进行智能清理
                         cleaned_chunk = self._clean_stream_chunk(raw_content)
                         
                         if cleaned_chunk:
@@ -170,20 +175,15 @@ class NotionAIProvider(BaseProvider):
             raise HTTPException(status_code=400, detail="此端点当前仅支持流式响应 (stream=true)。")
             
     def _clean_stream_chunk(self, content: str) -> str:
-        """
-        【新】智能清理函数：只移除乱码和特定结尾，保留XML标签。
-        """
         if not content:
             return ""
         
-        # 1. 移除类似Base64的乱码字符串
-        # 这个正则表达式匹配一个由字母、数字、+、/、=组成的、长度至少为50的字符串
+        # 移除类似Base64的乱码字符串
         content = re.sub(r'[A-Za-z0-9+/=]{50,}\s*', '', content)
         
-        # 2. 移除 "Start new chat"
+        # 移除 "Start new chat"
         content = content.replace("Start new chat", "")
 
-        # 3. 返回处理后的内容，如果是纯空格则返回空
         return content.strip() if not content.isspace() else ""
 
     def _prepare_headers(self, account: NotionAccount) -> Dict[str, str]:
@@ -242,7 +242,6 @@ class NotionAIProvider(BaseProvider):
         return payload
     
     def _parse_ndjson_line_comprehensive(self, line: bytes, event_num: int) -> List[Tuple[str, str]]:
-        # 此函数保持原样，我们将在外部清理内容
         results: List[Tuple[str, str]] = []
         try:
             s = line.decode("utf-8", errors="ignore").strip()
@@ -298,4 +297,3 @@ class NotionAIProvider(BaseProvider):
     async def get_models(self) -> JSONResponse:
         model_data = {"object": "list", "data": [{"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"} for name in settings.KNOWN_MODELS]}
         return JSONResponse(content=model_data)
-
