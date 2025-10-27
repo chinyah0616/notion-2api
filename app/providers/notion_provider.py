@@ -111,7 +111,7 @@ class NotionAIProvider(BaseProvider):
                 role_chunk = create_chat_completion_chunk(request_id, model_name, role="assistant")
                 yield create_sse_data(role_chunk)
 
-                # 2. 【核心修正】立即发送 <think> 标签作为第一个内容块
+                # 2. 立即发送 <think> 标签作为第一个内容块
                 initial_think_chunk = create_chat_completion_chunk(request_id, model_name, content="<think>")
                 yield create_sse_data(initial_think_chunk)
 
@@ -131,7 +131,7 @@ class NotionAIProvider(BaseProvider):
 
                 sync_gen = sync_stream_iterator()
                 
-                accumulated_content = ["<think>"] # 预先加入，用于日志
+                accumulated_content = ["<think>"]
                 event_count = 0
                 
                 while True:
@@ -147,6 +147,8 @@ class NotionAIProvider(BaseProvider):
                         
                         cleaned_chunk = self._clean_stream_chunk(raw_content)
                         
+                        # 即使清理后是空字符串（比如清掉了一个只有乱码的块），我们也不再发送
+                        # 但如果清理后剩下的是换行符，它会被发送
                         if cleaned_chunk:
                             chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_chunk)
                             yield create_sse_data(chunk)
@@ -175,16 +177,20 @@ class NotionAIProvider(BaseProvider):
             raise HTTPException(status_code=400, detail="此端点当前仅支持流式响应 (stream=true)。")
             
     def _clean_stream_chunk(self, content: str) -> str:
+        """
+        【核心修正】智能清理函数：只移除乱码和特定结尾，完整保留所有空白和换行符。
+        """
         if not content:
             return ""
         
-        # 移除类似Base64的乱码字符串
+        # 1. 移除类似Base64的乱码字符串
         content = re.sub(r'[A-Za-z0-9+/=]{50,}\s*', '', content)
         
-        # 移除 "Start new chat"
+        # 2. 移除 "Start new chat"
         content = content.replace("Start new chat", "")
 
-        return content.strip() if not content.isspace() else ""
+        # 3. 【重要】不再使用 .strip() 或 .isspace()，直接返回结果
+        return content
 
     def _prepare_headers(self, account: NotionAccount) -> Dict[str, str]:
         cookie_source = (account.cookie or "").strip()
@@ -271,7 +277,7 @@ class NotionAIProvider(BaseProvider):
                         if isinstance(val, str) and val: results.append(('add', val))
                         elif isinstance(val, dict):
                             if val.get("type") == "text" and "content" in val and val["content"]: results.append(('add', val["content"]))
-                            elif val.get("type") == "markdown-chat" and "value" in val and val["value"]: results.append(('add', val["value"]))
+                            elif val.get("type") in ("markdown-chat", "text") and "value" in val and val["value"]: results.append(('add', val["value"]))
             elif data.get("type") == "record-map" and "recordMap" in data:
                 if "thread_message" in data["recordMap"]:
                     for msg_data in data["recordMap"]["thread_message"].values():
@@ -286,11 +292,10 @@ class NotionAIProvider(BaseProvider):
 
     def _extract_content_from_step(self, step: Dict[str, Any]) -> Optional[str]:
         step_type = step.get("type")
-        if step_type == "markdown-chat": return step.get("value", "")
+        if step_type in ("markdown-chat", "text"): return step.get("value", "") or step.get("content", "")
         elif step_type == "agent-inference":
             for item in step.get("value", []):
                 if isinstance(item, dict) and item.get("type") == "text": return item.get("content", "")
-        elif step_type == "text": return step.get("content", "")
         if "value" in step and isinstance(step["value"], str): return step["value"]
         return None
 
