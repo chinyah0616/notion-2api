@@ -127,7 +127,6 @@ class NotionAIProvider(BaseProvider):
                 
                 accumulated_content = []
                 event_count = 0
-                sent_content_set = set()
                 
                 while True:
                     line = await run_in_threadpool(lambda: next(sync_gen, None))
@@ -140,26 +139,19 @@ class NotionAIProvider(BaseProvider):
                     for content_type, raw_content in parsed_results:
                         if not raw_content: continue
                         
-                        content_hash = hash(raw_content)
-                        if content_hash in sent_content_set: continue
-                        sent_content_set.add(content_hash)
+                        # 【核心修正】对每个数据块进行智能清理
+                        cleaned_chunk = self._clean_stream_chunk(raw_content)
                         
-                        if raw_content:
-                            chunk = create_chat_completion_chunk(request_id, model_name, content=raw_content)
+                        if cleaned_chunk:
+                            chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_chunk)
                             yield create_sse_data(chunk)
-                            accumulated_content.append(raw_content)
+                            accumulated_content.append(cleaned_chunk)
 
-                # 【核心修正】在所有内容接收完毕后，进行一次性清理
                 full_response = "".join(accumulated_content)
-                cleaned_response = self._clean_final_content(full_response)
-                
-                if cleaned_response:
-                    logger.info(f"清理后的完整响应: {cleaned_response[:200]}...")
+                if full_response:
+                    logger.info(f"完整响应（{event_count}个事件）: {full_response[:200]}...")
                 else:
-                    logger.warning(f"警告: 处理了{event_count}个事件但最终内容为空。")
-                
-                # 注意：由于我们已经流式发送了原始数据，这里不再重新发送
-                # 如果需要发送清理后的数据，需要改变上面的逻辑，这里仅作日志记录
+                    logger.warning(f"警告: 处理了{event_count}个事件但未提取到任何有效文本。")
 
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
                 yield create_sse_data(final_chunk)
@@ -177,18 +169,22 @@ class NotionAIProvider(BaseProvider):
         else:
             raise HTTPException(status_code=400, detail="此端点当前仅支持流式响应 (stream=true)。")
             
-    def _clean_final_content(self, content: str) -> str:
+    def _clean_stream_chunk(self, content: str) -> str:
         """
-        【新】对最终拼接好的内容进行清理，移除不必要的结尾。
-        这个函数不再用于流式块，只用于日志记录或非流式模式。
+        【新】智能清理函数：只移除乱码和特定结尾，保留XML标签。
         """
         if not content:
             return ""
         
-        # 移除末尾的 "Start new chat"
-        content = content.removesuffix("Start new chat").strip()
+        # 1. 移除类似Base64的乱码字符串
+        # 这个正则表达式匹配一个由字母、数字、+、/、=组成的、长度至少为50的字符串
+        content = re.sub(r'[A-Za-z0-9+/=]{50,}\s*', '', content)
         
-        return content
+        # 2. 移除 "Start new chat"
+        content = content.replace("Start new chat", "")
+
+        # 3. 返回处理后的内容，如果是纯空格则返回空
+        return content.strip() if not content.isspace() else ""
 
     def _prepare_headers(self, account: NotionAccount) -> Dict[str, str]:
         cookie_source = (account.cookie or "").strip()
@@ -246,7 +242,7 @@ class NotionAIProvider(BaseProvider):
         return payload
     
     def _parse_ndjson_line_comprehensive(self, line: bytes, event_num: int) -> List[Tuple[str, str]]:
-        # 【核心修正】在解析时移除 "Start new chat"
+        # 此函数保持原样，我们将在外部清理内容
         results: List[Tuple[str, str]] = []
         try:
             s = line.decode("utf-8", errors="ignore").strip()
@@ -255,49 +251,37 @@ class NotionAIProvider(BaseProvider):
             
             if event_num <= 3: logger.debug(f"事件#{event_num} 完整数据: {json.dumps(data, ensure_ascii=False)[:500]}")
             
-            # (内部解析逻辑保持不变，因为我们需要原始标签)
-            content_list = []
-
             if data.get("type") == "markdown-chat":
                 content = data.get("value", "")
-                if content: content_list.append(content)
+                if content: results.append(('direct', content))
             elif data.get("type") == "update":
                 if "value" in data:
                     value = data["value"]
-                    if isinstance(value, str) and value: content_list.append(value)
+                    if isinstance(value, str) and value: results.append(('update', value))
                     elif isinstance(value, dict):
                         for key in ["content", "text", "message", "value"]:
                             if key in value:
                                 content = value[key]
-                                if isinstance(content, str) and content: content_list.append(content); break
+                                if isinstance(content, str) and content: results.append(('update', content)); break
             elif data.get("type") == "patch" and "v" in data:
                 for op in data.get("v", []):
                     if not isinstance(op, dict): continue
                     op_type, val = op.get("o"), op.get("v")
-                    if op_type in ("r", "s", "x") and isinstance(val, str) and val: content_list.append(val)
+                    if op_type in ("r", "s", "x") and isinstance(val, str) and val: results.append((op_type, val))
                     elif op_type == "a":
-                        if isinstance(val, str) and val: content_list.append(val)
+                        if isinstance(val, str) and val: results.append(('add', val))
                         elif isinstance(val, dict):
-                            if val.get("type") == "text" and "content" in val and val["content"]: content_list.append(val["content"])
-                            elif val.get("type") == "markdown-chat" and "value" in val and val["value"]: content_list.append(val["value"])
+                            if val.get("type") == "text" and "content" in val and val["content"]: results.append(('add', val["content"]))
+                            elif val.get("type") == "markdown-chat" and "value" in val and val["value"]: results.append(('add', val["value"]))
             elif data.get("type") == "record-map" and "recordMap" in data:
                 if "thread_message" in data["recordMap"]:
                     for msg_data in data["recordMap"]["thread_message"].values():
                         step = msg_data.get("value", {}).get("value", {}).get("step", {})
                         if step:
                             content = self._extract_content_from_step(step)
-                            if content: content_list.append(content); break
-            elif "content" in data and isinstance(data["content"], str) and data["content"]: content_list.append(data["content"])
-            elif "text" in data and isinstance(data["text"], str) and data["text"]: content_list.append(data["text"])
-
-            # 对提取到的内容进行处理
-            for content in content_list:
-                # 过滤掉 "Start new chat"
-                if "Start new chat" in content:
-                    content = content.replace("Start new chat", "").strip()
-                if content:
-                    results.append(('parsed', content))
-
+                            if content: results.append(('record', content)); break
+            elif "content" in data and isinstance(data["content"], str) and data["content"]: results.append(('root', data["content"]))
+            elif "text" in data and isinstance(data["text"], str) and data["text"]: results.append(('root', data["text"]))
         except (json.JSONDecodeError, AttributeError): pass
         return results
 
