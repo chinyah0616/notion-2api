@@ -31,14 +31,12 @@ class NotionAIProvider(BaseProvider):
         if not settings.ACCOUNTS:
             raise ValueError("配置错误: 未找到任何 Notion 账号。")
         
-        # 线程安全的轮询器
         self.account_cycler = cycle(settings.ACCOUNTS)
         self.lock = threading.Lock()
 
         self._warmup_session()
         
     def _get_next_account(self) -> NotionAccount:
-        """线程安全地获取下一个账号"""
         with self.lock:
             account = next(self.account_cycler)
             logger.info(f"使用账号: {account.user_name or account.user_id}")
@@ -129,6 +127,7 @@ class NotionAIProvider(BaseProvider):
                 
                 accumulated_content = []
                 event_count = 0
+                sent_content_set = set()
                 
                 while True:
                     line = await run_in_threadpool(lambda: next(sync_gen, None))
@@ -141,19 +140,26 @@ class NotionAIProvider(BaseProvider):
                     for content_type, raw_content in parsed_results:
                         if not raw_content: continue
                         
-                        # 【核心修正】清洗内容
-                        cleaned_content = self._clean_content(raw_content)
+                        content_hash = hash(raw_content)
+                        if content_hash in sent_content_set: continue
+                        sent_content_set.add(content_hash)
                         
-                        if cleaned_content:
-                            chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_content)
+                        if raw_content:
+                            chunk = create_chat_completion_chunk(request_id, model_name, content=raw_content)
                             yield create_sse_data(chunk)
-                            accumulated_content.append(cleaned_content)
+                            accumulated_content.append(raw_content)
 
+                # 【核心修正】在所有内容接收完毕后，进行一次性清理
                 full_response = "".join(accumulated_content)
-                if full_response:
-                    logger.info(f"完整响应（{event_count}个事件）: {full_response[:200]}...")
+                cleaned_response = self._clean_final_content(full_response)
+                
+                if cleaned_response:
+                    logger.info(f"清理后的完整响应: {cleaned_response[:200]}...")
                 else:
-                    logger.warning(f"警告: 处理了{event_count}个事件但未提取到任何有效文本。")
+                    logger.warning(f"警告: 处理了{event_count}个事件但最终内容为空。")
+                
+                # 注意：由于我们已经流式发送了原始数据，这里不再重新发送
+                # 如果需要发送清理后的数据，需要改变上面的逻辑，这里仅作日志记录
 
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
                 yield create_sse_data(final_chunk)
@@ -171,37 +177,17 @@ class NotionAIProvider(BaseProvider):
         else:
             raise HTTPException(status_code=400, detail="此端点当前仅支持流式响应 (stream=true)。")
             
-    def _clean_content(self, content: str) -> str:
+    def _clean_final_content(self, content: str) -> str:
         """
-        【新增】清洗从 Notion AI 返回的原始文本流，去除思考过程、XML标签和其他非文本内容。
+        【新】对最终拼接好的内容进行清理，移除不必要的结尾。
+        这个函数不再用于流式块，只用于日志记录或非流式模式。
         """
         if not content:
             return ""
         
-        # 移除常见的思考过程XML标签
-        content = re.sub(r'<thinking>[\s\S]*?</thinking>', '', content, flags=re.DOTALL)
-        content = re.sub(r'<thought>[\s\S]*?</thought>', '', content, flags=re.DOTALL)
+        # 移除末尾的 "Start new chat"
+        content = content.removesuffix("Start new chat").strip()
         
-        # 移除其他可能的XML标签，但保留内容
-        content = re.sub(r'</?[^>]+>', '', content)
-        
-        # 移除可能出现在开头的、类似Base64的乱码字符串
-        # 这个正则表达式匹配一个由字母、数字、+、/、=组成的、长度至少为50的字符串
-        content = re.sub(r'^[A-Za-z0-9+/=]{50,}\s*', '', content)
-        
-        # 移除一些 Claude 模型特有的前缀
-        common_prefixes = [
-            "I'm sorry, I can't directly help with that, but I can provide some information.",
-            "I am unable to assist with that, as I am only a language model and do not have the capacity to understand and respond to your request.",
-            "I am not able to provide an answer to your question as I am a language model and do not have the capacity to help with that.",
-            # 中文
-            "我无法直接帮助您，但我可以提供一些信息。",
-            "我无法回答您的那个问题，因为我只是一个语言模型，无法理解并回应您的请求。",
-        ]
-        for prefix in common_prefixes:
-            if content.strip().startswith(prefix):
-                content = content.strip()[len(prefix):].lstrip()
-
         return content
 
     def _prepare_headers(self, account: NotionAccount) -> Dict[str, str]:
@@ -260,7 +246,7 @@ class NotionAIProvider(BaseProvider):
         return payload
     
     def _parse_ndjson_line_comprehensive(self, line: bytes, event_num: int) -> List[Tuple[str, str]]:
-        # (此函数保持不变)
+        # 【核心修正】在解析时移除 "Start new chat"
         results: List[Tuple[str, str]] = []
         try:
             s = line.decode("utf-8", errors="ignore").strip()
@@ -269,42 +255,53 @@ class NotionAIProvider(BaseProvider):
             
             if event_num <= 3: logger.debug(f"事件#{event_num} 完整数据: {json.dumps(data, ensure_ascii=False)[:500]}")
             
+            # (内部解析逻辑保持不变，因为我们需要原始标签)
+            content_list = []
+
             if data.get("type") == "markdown-chat":
                 content = data.get("value", "")
-                if content: results.append(('direct', content))
+                if content: content_list.append(content)
             elif data.get("type") == "update":
                 if "value" in data:
                     value = data["value"]
-                    if isinstance(value, str) and value: results.append(('update', value))
+                    if isinstance(value, str) and value: content_list.append(value)
                     elif isinstance(value, dict):
                         for key in ["content", "text", "message", "value"]:
                             if key in value:
                                 content = value[key]
-                                if isinstance(content, str) and content: results.append(('update', content)); break
+                                if isinstance(content, str) and content: content_list.append(content); break
             elif data.get("type") == "patch" and "v" in data:
                 for op in data.get("v", []):
                     if not isinstance(op, dict): continue
                     op_type, val = op.get("o"), op.get("v")
-                    if op_type in ("r", "s", "x") and isinstance(val, str) and val: results.append((op_type, val))
+                    if op_type in ("r", "s", "x") and isinstance(val, str) and val: content_list.append(val)
                     elif op_type == "a":
-                        if isinstance(val, str) and val: results.append(('add', val))
+                        if isinstance(val, str) and val: content_list.append(val)
                         elif isinstance(val, dict):
-                            if val.get("type") == "text" and "content" in val and val["content"]: results.append(('add', val["content"]))
-                            elif val.get("type") == "markdown-chat" and "value" in val and val["value"]: results.append(('add', val["value"]))
+                            if val.get("type") == "text" and "content" in val and val["content"]: content_list.append(val["content"])
+                            elif val.get("type") == "markdown-chat" and "value" in val and val["value"]: content_list.append(val["value"])
             elif data.get("type") == "record-map" and "recordMap" in data:
                 if "thread_message" in data["recordMap"]:
                     for msg_data in data["recordMap"]["thread_message"].values():
                         step = msg_data.get("value", {}).get("value", {}).get("step", {})
                         if step:
                             content = self._extract_content_from_step(step)
-                            if content: results.append(('record', content)); break
-            elif "content" in data and isinstance(data["content"], str) and data["content"]: results.append(('root', data["content"]))
-            elif "text" in data and isinstance(data["text"], str) and data["text"]: results.append(('root', data["text"]))
+                            if content: content_list.append(content); break
+            elif "content" in data and isinstance(data["content"], str) and data["content"]: content_list.append(data["content"])
+            elif "text" in data and isinstance(data["text"], str) and data["text"]: content_list.append(data["text"])
+
+            # 对提取到的内容进行处理
+            for content in content_list:
+                # 过滤掉 "Start new chat"
+                if "Start new chat" in content:
+                    content = content.replace("Start new chat", "").strip()
+                if content:
+                    results.append(('parsed', content))
+
         except (json.JSONDecodeError, AttributeError): pass
         return results
 
     def _extract_content_from_step(self, step: Dict[str, Any]) -> Optional[str]:
-        # (此函数保持不变)
         step_type = step.get("type")
         if step_type == "markdown-chat": return step.get("value", "")
         elif step_type == "agent-inference":
@@ -317,3 +314,4 @@ class NotionAIProvider(BaseProvider):
     async def get_models(self) -> JSONResponse:
         model_data = {"object": "list", "data": [{"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"} for name in settings.KNOWN_MODELS]}
         return JSONResponse(content=model_data)
+
