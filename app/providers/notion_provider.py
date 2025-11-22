@@ -37,10 +37,9 @@ class NotionAIProvider(BaseProvider):
         # 【核心修正】严格使用您提供的、不带结尾的正则表达式，不做任何改动
         self.lang_tag_pattern = re.compile(r'<lang primary="(?:zh(?:-C?N?)?)?')
         
-        # 添加内容去重和状态管理
+        # 简化状态管理，只保留去重功能
         self.last_content = ""
         self.content_buffer = []
-        self.is_thinking = True
 
         self._warmup_session()
         
@@ -118,11 +117,9 @@ class NotionAIProvider(BaseProvider):
                 role_chunk = create_chat_completion_chunk(request_id, model_name, role="assistant")
                 yield create_sse_data(role_chunk)
 
-                # 重置状态
+                # 重置去重状态
                 self.last_content = ""
                 self.content_buffer = []
-                self.is_thinking = True
-
 
                 def sync_stream_iterator():
                     try:
@@ -156,20 +153,11 @@ class NotionAIProvider(BaseProvider):
                         cleaned_chunk = self._clean_stream_chunk(raw_content)
                         
                         if cleaned_chunk and not self._is_duplicate_content(cleaned_chunk):
-                            # 检查是否从思考模式切换到回答模式
-                            if self.is_thinking and self._is_answer_start(cleaned_chunk):
-                                self.is_thinking = False
-                                # 发送思考结束标记
-                                think_end_chunk = create_chat_completion_chunk(request_id, model_name, content="</think>\n\n")
-                                yield create_sse_data(think_end_chunk)
-                                accumulated_content.append("</think>\n\n")
-                                
-                            # 只有在非思考模式下才发送内容，或者是思考内容
-                            if not self.is_thinking or self._is_thinking_content(cleaned_chunk):
-                                chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_chunk)
-                                yield create_sse_data(chunk)
-                                accumulated_content.append(cleaned_chunk)
-                                self.last_content = cleaned_chunk
+                            # 简化逻辑：直接发送所有有效内容，不做复杂的思考/回答判断
+                            chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_chunk)
+                            yield create_sse_data(chunk)
+                            accumulated_content.append(cleaned_chunk)
+                            self.last_content = cleaned_chunk
 
                 full_response = "".join(accumulated_content)
                 if full_response:
@@ -177,10 +165,7 @@ class NotionAIProvider(BaseProvider):
                 else:
                     logger.warning(f"警告: 处理了{event_count}个事件但未提取到任何有效文本。")
                 
-                # 如果还在思考模式，发送结束标记
-                if self.is_thinking:
-                    think_end_chunk = create_chat_completion_chunk(request_id, model_name, content="</think>\n\n")
-                    yield create_sse_data(think_end_chunk)
+                # 移除思考模式的复杂逻辑
 
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
                 yield create_sse_data(final_chunk)
@@ -202,22 +187,23 @@ class NotionAIProvider(BaseProvider):
         if not content:
             return ""
         
+        # 保存原始内容用于调试
         original_content = content
         
-        # 1. 【核心修正】更安全的语言标签处理，避免误删首字符
-        if self.lang_tag_pattern.search(content):
-            # 找到语言标签的位置，只替换标签部分，保留其他内容
-            content = self.lang_tag_pattern.sub("", content)
-        
-        # 2. 移除类似Base64的乱码字符串
+        # 1. 只处理明显的垃圾内容，不做过度清理
+        # 移除 "Start new chat" 和类似Base64的乱码
+        content = content.replace("Start new chat", "")
         content = re.sub(r'[A-Za-z0-9+/=]{50,}\s*', '', content)
         
-        # 3. 移除 "Start new chat"
-        content = content.replace("Start new chat", "")
-        
-        # 4. 移除多余的空白字符，但保留必要的换行
+        # 2. 只在内容中间有过多空行时才清理，保留开头和结尾的空格
         content = re.sub(r'\n{3,}', '\n\n', content)
-        content = content.strip()
+        
+        # 3. 只移除结尾的空白，保留开头的空格（可能是缩进）
+        content = content.rstrip()
+        
+        # 4. 如果清理后内容为空或只有空白，返回空字符串
+        if not content or content.isspace():
+            return ""
 
         return content
     
@@ -241,15 +227,7 @@ class NotionAIProvider(BaseProvider):
             
         return False
     
-    def _is_thinking_content(self, content: str) -> bool:
-        """判断是否为思考内容"""
-        thinking_indicators = ["让我", "我需要", "首先", "然后", "接下来", "考虑", "分析", "思考"]
-        return any(indicator in content for indicator in thinking_indicators)
-    
-    def _is_answer_start(self, content: str) -> bool:
-        """判断是否为回答开始"""
-        answer_indicators = ["根据", "基于", "答案是", "结果是", "总结", "综上"]
-        return any(indicator in content for indicator in answer_indicators) or len(content) > 50
+    # 移除不必要的复杂判断逻辑，简化处理流程
 
     def _prepare_headers(self, account: NotionAccount) -> Dict[str, str]:
         cookie_source = (account.cookie or "").strip()
