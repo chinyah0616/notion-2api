@@ -41,14 +41,14 @@ class Settings(BaseSettings):
     DEFAULT_MODEL: str = "claude-sonnet-4.5"
     KNOWN_MODELS: List[str] = [
         "claude-sonnet-4.5", "gpt-5", "claude-opus-4.1",
-        "gemini-2.5-flash（未修复，不可用）", "gemini-2.5-pro（未修复，不可用）", "gpt-4.1"
+        "gemini-2.5-flash（未修复，不可用）", "gemini-3.0-pro", "gpt-4.1"
     ]
     MODEL_MAP: dict = {
         "claude-sonnet-4.5": "anthropic-sonnet-alt",
         "gpt-5": "openai-turbo",
         "claude-opus-4.1": "anthropic-opus-4.1",
         "gemini-2.5-flash（未修复，不可用）": "vertex-gemini-2.5-flash",
-        "gemini-2.5-pro（未修复，不可用）": "vertex-gemini-2.5-pro",
+        "gemini-3.0-pro": "vertex-gemini-3.0-pro",
         "gpt-4.1": "openai-gpt-4.1"
     }
 
@@ -84,4 +84,5 @@ class Settings(BaseSettings):
         print(f"成功加载 {len(self.ACCOUNTS)} 个 Notion 账号。")
 
 settings = Settings()
+
 
